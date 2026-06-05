@@ -209,7 +209,7 @@ else:
     np.save(CACHE_Y, y_scores)
     print(f"Done. Shape: {X_processed.shape}")
 
-    # ── CELL 5: Train / Val / Test Split ─────────────────────────
+# ── CELL 5: Train / Val / Test Split ─────────────────────────
 X_trainval, X_test, y_trainval, y_test = train_test_split(
     X_processed, y_scores,
     test_size=cfg.TEST_RATIO, random_state=42)
@@ -223,7 +223,7 @@ print(f"Train : {len(X_train)}")
 print(f"Val   : {len(X_val)}")
 print(f"Test  : {len(X_test)}")
  
- # ── CELL 6: Augmentation & Data Pipelines ────────────────────
+# ── CELL 6: Augmentation & Data Pipelines ────────────────────
 rotation_layer = tf.keras.layers.RandomRotation(10/360)
 
 def augment(image, label):

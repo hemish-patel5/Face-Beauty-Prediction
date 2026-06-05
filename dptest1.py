@@ -12,7 +12,7 @@ from scipy.stats import pearsonr
 IMG_SIZE    = 224
 BATCH_SIZE  = 16
 EPOCHS_HEAD = 15
-EPOCHS_FINE = 40
+EPOCHS_FINE = 80
 LR_HEAD     = 1e-3
 LR_FINE     = 1e-5
 
@@ -99,10 +99,8 @@ model.fit(
 total = len(base.layers)
 freeze_until = total // 3
 
-for layer in base.layers[:freeze_until]:
-    layer.trainable = False
-for layer in base.layers[freeze_until:]:
-    layer.trainable = True
+for layer in base.layers:
+    layer.trainable = True  # unfreeze everything
 
 # cosine decay over the full fine-tuning run
 steps_per_epoch = len(X_train) // BATCH_SIZE
