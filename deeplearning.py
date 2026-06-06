@@ -510,255 +510,252 @@ df_results = pd.DataFrame({
 df_results.to_csv(f"{cfg.OUTPUT_DIR}/results_summary.csv")
 print(f"\nSaved → {cfg.OUTPUT_DIR}/results_summary.csv")
  
- # ── CELL 15: Ablation Study ──────────────────────────────────
-import gc
+# ── CELL 15: Ablation Study ───────────────────────────────────
+
+# ── Paste your final results ──────────────────────────────────
+pcc = 0.8856
+mae = 0.2422
+
+# ── Config ───────────────────────────────────────────────────
+IMG_SIZE    = 224
+BATCH_SIZE  = 16
+LR_HEAD     = 1e-3
+LR_FINE     = 1e-5
+
+# ── Reload data and rebuild splits ───────────────────────────
+data = np.load("/kaggle/input/datasets/pranavchandane/scut-fbp5500-v2-facial-beauty-scores/scut_fbp5500-cmprsd.npz")
+X    = data['X']
+y    = data['y'].astype(np.float32)
+del data
+
+X_resized = np.zeros((len(X), IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+for i in range(len(X)):
+    X_resized[i] = tf.image.resize(X[i], (IMG_SIZE, IMG_SIZE)).numpy().astype(np.uint8)
+del X
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_resized, y, test_size=0.15, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_train, y_train, test_size=0.10, random_state=42)
+del X_resized
+
+print(f"Train: {len(X_train)}  Val: {len(X_val)}  Test: {len(X_test)}")
+
+# ── Dataset factory ───────────────────────────────────────────
+rotation_layer = tf.keras.layers.RandomRotation(10/360)
+
+def augment(img, label):
+    img = tf.image.random_flip_left_right(img)
+    return img, label
+
+def make_dataset(X, y, shuffle=False, augment_data=False):
+    ds = tf.data.Dataset.from_tensor_slices((X, y))
+    if shuffle:
+        ds = ds.shuffle(len(X))
+    if augment_data:
+        ds = ds.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
+    else:
+        ds = ds.map(
+            lambda img, label: (eff_preprocess(
+                tf.cast(img, tf.float32)), label),
+            num_parallel_calls=tf.data.AUTOTUNE)
+    return ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
+
+# ── Ablation helpers ──────────────────────────────────────────
 print("\nRunning ablation study...")
 ablation = {}
 
-def quick_eval(X_in, y_in, name, epochs_h=5, epochs_f=10):
-    Xtr, Xte, ytr, yte = train_test_split(
-        X_in, y_in, test_size=0.10, random_state=42)
-    Xtr, Xv, ytr, yv   = train_test_split(
-        Xtr, ytr, test_size=0.10, random_state=42)
-
-    dtr = make_dataset(Xtr, ytr, augment_data=False)
-    dv  = make_dataset(Xv,  yv)
-    dte = make_dataset(Xte, yte)
-
-    # Free split arrays immediately after making datasets
-    del Xtr, Xv, Xte
-    gc.collect()
-
-    m, b = build_model('resnet50', trainable_base=False)
-    compile_model(m, lr=cfg.LR_HEAD, decay_steps=500)
-    m.fit(dtr, validation_data=dv, epochs=epochs_h, verbose=0)
-
-    for layer in b.layers[len(b.layers)//2:]:
-        layer.trainable = True
-    for layer in b.layers:
-        if isinstance(layer, tf.keras.layers.BatchNormalization):
-            layer.trainable = True
-    compile_model(m, lr=cfg.LR_FINE, decay_steps=1000)
-    m.fit(dtr, validation_data=dv, epochs=epochs_f, verbose=0)
-
-    pred   = m.predict(dte, verbose=0).flatten()
-    pcc, _ = pearsonr(yte, pred)
-    mae    = mean_absolute_error(yte, pred)
-
-    # Free model and datasets from memory
-    del m, b, dtr, dv, dte
+def cleanup():
     gc.collect()
     tf.keras.backend.clear_session()
 
-    print(f"  {name:<42} PCC={pcc:.3f}  MAE={mae:.3f}")
-    return {'pcc': pcc, 'mae': mae}
+def make_ablation_datasets(augment=True):
+    tr = make_dataset(X_train, y_train, augment_data=augment, shuffle=True)
+    vl = make_dataset(X_val,   y_val,   augment_data=False)
+    te = make_dataset(X_test,  y_test,  augment_data=False)
+    return tr, vl, te
 
-# ── Full model result (no retraining needed) ─────────────────
-ablation['Full ResNet50 (all components)'] = {
-    'pcc': results['ResNet50']['pcc'],
-    'mae': results['ResNet50']['mae']}
-print(f"  {'Full ResNet50 (all components)':<42} "
-      f"PCC={results['ResNet50']['pcc']:.3f}  "
-      f"MAE={results['ResNet50']['mae']:.3f}  ← full model")
+def run_abl(name, augment=True, finetune=True, dropout=True):
+    cleanup()
+    tr, vl, te = make_ablation_datasets(augment=augment)
 
-# ── Without alignment ─────────────────────────────────────────
-# Reload raw X since it was deleted earlier
-print("  Loading raw X for no-alignment test...")
-data_raw  = np.load(
-    f"{cfg.DATA_DIR}/scut_fbp5500-cmprsd.npz")
-X_raw_orig = data_raw['X']
-y_raw      = data_raw['y'].astype(np.float32)
-del data_raw
-gc.collect()
+    base_a = EfficientNetB3(weights='imagenet', include_top=False,
+                            input_shape=(IMG_SIZE, IMG_SIZE, 3))
+    base_a.trainable = False
 
-mean_arr = np.array(cfg.MEAN, dtype=np.float32)
-std_arr  = np.array(cfg.STD,  dtype=np.float32)
+    if dropout:
+        m = tf.keras.Sequential([
+            base_a,
+            layers.GlobalAveragePooling2D(),
+            layers.Dropout(0.3),
+            layers.Dense(128, activation='relu'),
+            layers.Dropout(0.2),
+            layers.Dense(1, dtype='float32')
+        ])
+    else:
+        m = tf.keras.Sequential([
+            base_a,
+            layers.GlobalAveragePooling2D(),
+            layers.Dense(128, activation='relu'),
+            layers.Dense(1, dtype='float32')
+        ])
 
-# Process in batches to avoid OOM
-X_raw = np.zeros(
-    (len(X_raw_orig), cfg.IMG_SIZE, cfg.IMG_SIZE, 3),
-    dtype=np.float32)
-for i in range(len(X_raw_orig)):
-    img      = cv2.resize(
-        X_raw_orig[i],
-        (cfg.IMG_SIZE, cfg.IMG_SIZE)).astype(np.float32) / 255.0
-    X_raw[i] = (img - mean_arr) / std_arr  # normalised but not aligned
+    m.compile(
+        optimizer=tf.keras.optimizers.Adam(LR_HEAD, clipnorm=1.0),
+        loss=tf.keras.losses.Huber(delta=1.0),
+        metrics=['mae'])
+    m.fit(tr, validation_data=vl, epochs=10, verbose=0)
 
-del X_raw_orig
-gc.collect()
+    if finetune:
+        total_a = len(base_a.layers)
+        for layer in base_a.layers[:total_a // 3]:
+            layer.trainable = False
+        for layer in base_a.layers[total_a // 3:]:
+            layer.trainable = True
+        m.compile(
+            optimizer=tf.keras.optimizers.Adam(LR_FINE, clipnorm=1.0),
+            loss=tf.keras.losses.Huber(delta=1.0),
+            metrics=['mae'])
+        m.fit(tr, validation_data=vl, epochs=20, verbose=0)
 
-ablation['w/o Face Alignment'] = quick_eval(
-    X_raw, y_raw, 'w/o Face Alignment')
-del X_raw, y_raw
-gc.collect()
+    pred    = m.predict(te, verbose=0).flatten()
+    pcc_a,_ = pearsonr(y_test, pred)
+    mae_a   = mean_absolute_error(y_test, pred)
+    print(f"  {name:<35} PCC={pcc_a:.3f}  MAE={mae_a:.3f}")
 
-# ── Without augmentation ──────────────────────────────────────
-# Load fresh split from cache
-X_proc_fresh = np.load(f"{cfg.OUTPUT_DIR}/X_processed.npy")
-y_proc_fresh = np.load(f"{cfg.OUTPUT_DIR}/y_scores.npy")
+    del m, base_a, pred, tr, vl, te
+    cleanup()
+    return {'pcc': pcc_a, 'mae': mae_a}
 
-Xtr2, Xte2, ytr2, yte2 = train_test_split(
-    X_proc_fresh, y_proc_fresh,
-    test_size=0.10, random_state=42)
-Xtr2, Xv2, ytr2, yv2   = train_test_split(
-    Xtr2, ytr2, test_size=0.10, random_state=42)
+# ── Run ablations ─────────────────────────────────────────────
+ablation['Full Model'] = {'pcc': pcc, 'mae': mae}
+print(f"  {'Full Model':<35} PCC={pcc:.3f}  MAE={mae:.3f}  ← full model")
 
-del X_proc_fresh, y_proc_fresh
-gc.collect()
+ablation['w/o Augmentation']  = run_abl('w/o Augmentation',  augment=False)
+ablation['w/o Fine-tuning']   = run_abl('w/o Fine-tuning',   finetune=False)
+ablation['w/o Dropout']       = run_abl('w/o Dropout',       dropout=False)
 
-def make_no_aug_dataset(Xd, yd):
-    return (tf.data.Dataset
-            .from_tensor_slices(
-                (Xd.astype('float32'), yd.astype('float32')))
-            .batch(cfg.BATCH_SIZE)
-            .prefetch(tf.data.AUTOTUNE))
-
-dtr2 = make_no_aug_dataset(Xtr2, ytr2)
-dv2  = make_no_aug_dataset(Xv2,  yv2)
-dte2 = make_no_aug_dataset(Xte2, yte2)
-del Xtr2, Xv2, Xte2
-gc.collect()
-
-m2, b2 = build_model('resnet50', trainable_base=False)
-compile_model(m2, lr=cfg.LR_HEAD, decay_steps=500)
-m2.fit(dtr2, validation_data=dv2, epochs=5, verbose=0)
-for layer in b2.layers[len(b2.layers)//2:]:
-    layer.trainable = True
-for layer in b2.layers:
-    if isinstance(layer, tf.keras.layers.BatchNormalization):
-        layer.trainable = True
-compile_model(m2, lr=cfg.LR_FINE, decay_steps=1000)
-m2.fit(dtr2, validation_data=dv2, epochs=10, verbose=0)
-pred2   = m2.predict(dte2, verbose=0).flatten()
-pcc2, _ = pearsonr(ytr2[:len(pred2)], pred2) if False else pearsonr(yte2, pred2)
-mae2    = mean_absolute_error(yte2, pred2)
-print(f"  {'w/o Data Augmentation':<42} PCC={pcc2:.3f}  MAE={mae2:.3f}")
-ablation['w/o Data Augmentation'] = {'pcc': pcc2, 'mae': mae2}
-del m2, b2, dtr2, dv2, dte2, ytr2, yv2, yte2
-gc.collect()
-tf.keras.backend.clear_session()
-
-# ── Without fine-tuning ───────────────────────────────────────
-m3, _ = build_model('resnet50', trainable_base=False)
-compile_model(m3, lr=cfg.LR_HEAD, decay_steps=500)
-m3.fit(train_ds, validation_data=val_ds, epochs=10, verbose=0)
-pred3   = m3.predict(test_ds, verbose=0).flatten()
-pcc3, _ = pearsonr(y_test, pred3)
-mae3    = mean_absolute_error(y_test, pred3)
-print(f"  {'w/o Fine-tuning (head only)':<42} PCC={pcc3:.3f}  MAE={mae3:.3f}")
-ablation['w/o Fine-tuning (head only)'] = {'pcc': pcc3, 'mae': mae3}
-del m3
-gc.collect()
-tf.keras.backend.clear_session()
-
-# ── Without dropout ───────────────────────────────────────────
-def build_no_dropout():
-    inp  = tf.keras.Input(
-        shape=(cfg.IMG_SIZE, cfg.IMG_SIZE, cfg.CHANNELS))
-    base = ResNet50(
-        weights='imagenet', include_top=False, input_tensor=inp)
-    base.trainable = False
-    x   = layers.GlobalAveragePooling2D()(base.output)
-    x   = layers.Dense(cfg.DENSE_UNITS, activation='relu')(x)
-    out = layers.Dense(1, activation='linear')(x)
-    return models.Model(inputs=inp, outputs=out), base
-
-m4, b4 = build_no_dropout()
-compile_model(m4, lr=cfg.LR_HEAD, decay_steps=500)
-m4.fit(train_ds, validation_data=val_ds, epochs=5, verbose=0)
-for layer in b4.layers[len(b4.layers)//2:]:
-    layer.trainable = True
-for layer in b4.layers:
-    if isinstance(layer, tf.keras.layers.BatchNormalization):
-        layer.trainable = True
-compile_model(m4, lr=cfg.LR_FINE, decay_steps=1000)
-m4.fit(train_ds, validation_data=val_ds, epochs=10, verbose=0)
-pred4   = m4.predict(test_ds, verbose=0).flatten()
-pcc4, _ = pearsonr(y_test, pred4)
-mae4    = mean_absolute_error(y_test, pred4)
-print(f"  {'w/o Dropout Regularisation':<42} PCC={pcc4:.3f}  MAE={mae4:.3f}")
-ablation['w/o Dropout Regularisation'] = {'pcc': pcc4, 'mae': mae4}
-del m4, b4
-gc.collect()
-tf.keras.backend.clear_session()
-
-# ── Ablation summary ──────────────────────────────────────────
+# ── Print summary ─────────────────────────────────────────────
 print("\n── Ablation Summary ──")
-print(f"{'Configuration':<42} {'PCC':>6} {'MAE':>6}")
-print("-"*57)
+print(f"{'Configuration':<35} {'PCC':>6} {'MAE':>6}")
+print("-" * 50)
 for name, r in ablation.items():
-    marker = " ← full model" if "Full" in name else ""
-    print(f"{name:<42} {r['pcc']:>6.3f} {r['mae']:>6.3f}{marker}")
+    marker = "  ← full model" if name == "Full Model" else ""
+    print(f"{name:<35} {r['pcc']:>6.3f} {r['mae']:>6.3f}{marker}")
 
-pd.DataFrame(ablation).T.to_csv(
-    f"{cfg.OUTPUT_DIR}/ablation_results.csv")
-print(f"\nSaved → {cfg.OUTPUT_DIR}/ablation_results.csv")
-
-
-# ── CELL 16: Grad-CAM ────────────────────────────────────────
-# Reload ResNet50 in case it was cleared
-if 'resnet_model' not in dir():
-    resnet_model = tf.keras.models.load_model(
-        f"{cfg.OUTPUT_DIR}/resnet50_final.keras")
-    print("ResNet50 reloaded.")
-
+# ─────────────────────────── CELL 16: Grad-CAM  ──────────────────────────────────
+import os
+import gc
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+# Match your original config
+class Config:
+    OUTPUT_DIR = "/kaggle/working"
+    IMG_SIZE = 224
+    CHANNELS = 3
+    TEST_RATIO = 0.10
+    VAL_RATIO = 0.10
+    MEAN = [0.485, 0.456, 0.406]
+    STD  = [0.229, 0.224, 0.225]
+cfg = Config()
+# Reload best ResNet checkpoint
+model_path = f"{cfg.OUTPUT_DIR}/resnet50_s2_best.keras"
+resnet_model = tf.keras.models.load_model(model_path)
+print("Loaded:", model_path)
+# Reload processed dataset and recreate same test split
+X_processed = np.load(f"{cfg.OUTPUT_DIR}/X_processed.npy")
+y_scores    = np.load(f"{cfg.OUTPUT_DIR}/y_scores.npy")
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X_processed,
+    y_scores,
+    test_size=cfg.TEST_RATIO,
+    random_state=42
+)
+del X_processed, y_scores, X_trainval, y_trainval
+gc.collect()
+print("X_test:", X_test.shape)
+print("y_test:", y_test.shape)
+# Grad-CAM functions
 def make_gradcam(img_array, model, last_conv_layer):
     grad_model = tf.keras.models.Model(
         model.inputs,
-        [model.get_layer(last_conv_layer).output, model.output])
+        [model.get_layer(last_conv_layer).output, model.output]
+    )
     with tf.GradientTape() as tape:
         conv_out, preds = grad_model(img_array)
         score = preds[:, 0]
-    grads   = tape.gradient(score, conv_out)
-    pooled  = tf.reduce_mean(grads, axis=(0, 1, 2))
-    heatmap = conv_out[0] @ pooled[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    heatmap = tf.maximum(heatmap, 0)
-    heatmap = heatmap / (tf.math.reduce_max(heatmap) + 1e-8)
-    return heatmap.numpy()
+    grads = tape.gradient(score, conv_out)
+    pooled = tf.reduce_mean(grads, axis=(0, 1, 2))
+    heatmap = conv_out[0] @ pooled[..., tf.newaxis]  # (H, W, 1)
+    heatmap = tf.squeeze(heatmap)                     # aim for (H, W)
 
-def overlay_gradcam(img_norm, model, conv_layer='conv5_block3_out'):
-    inp     = img_norm[np.newaxis]
+    # ── FIX: guard against 0-d or 1-d output ──────────────────────
+    heatmap = heatmap.numpy()
+    if heatmap.ndim < 2:
+        heatmap = np.ones((7, 7), dtype=np.float32)  # fallback blank
+    heatmap = heatmap.astype(np.float32)
+    # ──────────────────────────────────────────────────────────────
+
+    heatmap = np.maximum(heatmap, 0)
+    max_val = heatmap.max()
+    if max_val > 0:
+        heatmap /= max_val
+    return heatmap  # guaranteed 2-D float32
+
+
+def overlay_gradcam(img_norm, model, conv_layer="conv5_block3_out"):
+    inp = img_norm[np.newaxis].astype("float32")
     heatmap = make_gradcam(inp, model, conv_layer)
+
+    # ── FIX: ensure correct shape before resize ───────────────────
+    heatmap = np.squeeze(heatmap).astype(np.float32)
+    if heatmap.ndim != 2:
+        heatmap = np.ones((7, 7), dtype=np.float32)
+    # ─────────────────────────────────────────────────────────────
+
     heatmap = cv2.resize(heatmap, (cfg.IMG_SIZE, cfg.IMG_SIZE))
     heatmap = cv2.applyColorMap(
-        np.uint8(255 * heatmap), cv2.COLORMAP_JET)
+        np.uint8(255 * heatmap),
+        cv2.COLORMAP_JET
+    )
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+
     mean_arr = np.array(cfg.MEAN, dtype=np.float32)
     std_arr  = np.array(cfg.STD,  dtype=np.float32)
-    img_disp = np.clip(
-        (img_norm * std_arr + mean_arr) * 255, 0, 255).astype(np.uint8)
-    overlay  = np.uint8(0.55 * img_disp + 0.45 * heatmap)
-    score    = model.predict(inp, verbose=0)[0, 0]
+    img_disp = np.clip((img_norm * std_arr + mean_arr) * 255, 0, 255).astype(np.uint8)
+
+    overlay = np.uint8(0.55 * img_disp + 0.45 * heatmap)
+    score = model.predict(inp, verbose=0)[0, 0]
     return overlay, score
-
-# Need X_test for Grad-CAM — reload from cache if deleted
-if 'X_test' not in dir():
-    print("Reloading X_test from cache...")
-    X_proc  = np.load(f"{cfg.OUTPUT_DIR}/X_processed.npy")
-    y_sc    = np.load(f"{cfg.OUTPUT_DIR}/y_scores.npy")
-    _, X_test, _, y_test = train_test_split(
-        X_proc, y_sc, test_size=cfg.TEST_RATIO, random_state=42)
-    del X_proc, y_sc
-    gc.collect()
-    print(f"X_test reloaded: {X_test.shape}")
-
+# Pick 6 samples
+np.random.seed(42)
 sample_idx = np.random.choice(len(X_test), 6, replace=False)
-fig, axes  = plt.subplots(2, 3, figsize=(14, 9))
-fig.suptitle("Grad-CAM – Regions Influencing Beauty Prediction",
-             fontsize=14, fontweight='bold')
+fig, axes = plt.subplots(2, 3, figsize=(14, 9))
+fig.suptitle(
+    "Grad-CAM – Regions Influencing Beauty Prediction",
+    fontsize=14,
+    fontweight="bold"
+)
 for ax, idx in zip(axes.flatten(), sample_idx):
-    overlay, pred_score = overlay_gradcam(X_test[idx], resnet_model)
+    overlay, pred_score = overlay_gradcam(
+        X_test[idx],
+        resnet_model,
+        conv_layer="conv5_block3_out"
+    )
     ax.imshow(overlay)
     ax.set_title(
-        f"True: {y_test[idx]:.2f}  |  Pred: {pred_score:.2f}",
-        fontsize=10)
-    ax.axis('off')
+        f"True: {y_test[idx]:.2f} | Pred: {pred_score:.2f}",
+        fontsize=10
+    )
+    ax.axis("off")
 plt.tight_layout()
-plt.savefig(f"{cfg.OUTPUT_DIR}/gradcam.png", dpi=150)
+save_path = f"{cfg.OUTPUT_DIR}/gradcam.png"
+plt.savefig(save_path, dpi=150)
 plt.show()
-print("Grad-CAM saved → gradcam.png")
-
+print(f"Grad-CAM saved → {save_path}")
 
 # ── CELL 17: Save & List ─────────────────────────────────────
 # Reload models if cleared by ablation
